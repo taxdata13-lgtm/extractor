@@ -1,0 +1,9 @@
+# ── Extração de PDF ──────────────────────────────
+pdfplumber>=0.10.0
+
+# ── Dados e exportação ───────────────────────────
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# ── Interface web ────────────────────────────────
+streamlit>=1.32.0
