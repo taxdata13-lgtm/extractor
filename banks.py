@@ -386,9 +386,157 @@ class BancoBrasilParser(BankParser):
         return '/'.join(p)
 
 
+# ── Itaú ──────────────────────────────────────────────────────────────────────
+
+class ItauParser(BankParser):
+    """
+    Parser para extratos do Itaú (pessoa física/jurídica via Internet Banking).
+
+    Layout (pdfplumber extract_text com layout=True):
+      - Linhas âncora:       5 espaços + DD/MM/AAAA + resto da transação
+      - Linhas de continuação: 9+ espaços + fragmento (Razão Social, código etc.)
+
+    Regra de sinais:
+      - Valor com prefixo '-' → DÉBITO  (PIX ENVIADO, PAGAMENTOS, BOLETOS)
+      - Valor sem prefixo     → CRÉDITO (PIX RECEBIDO, RECEBIMENTO REDE)
+    """
+
+    BANK_SIGNATURES = [
+        "ITAU",
+        "itaú",
+        "Lançamentos do período",    # cabeçalho exclusivo do Itaú
+        "Razão Social",              # coluna exclusiva do Itaú
+        "SALDO TOTAL DISPONÍVEL DIA" # linha de saldo exclusiva do Itaú
+    ]
+
+    # Linha âncora: exatamente 4-8 espaços de recuo + data DD/MM/AAAA
+    _ANCHOR_RE = re.compile(r'^ {4,8}(\d{2}/\d{2}/\d{4})\s+(.*?)\s*$')
+
+    # Linha de continuação: 9+ espaços de recuo + conteúdo não-vazio
+    _CONT_RE = re.compile(r'^ {9,}(\S.*?)\s*$')
+
+    # Palavras-chave que identificam descrições de transação (vs. Razão Social)
+    _KEYWORD_RE = re.compile(
+        r'^(PIX|PAGAMENTOS|RECEBIMENTO|BOLETO|RENDIMENTOS|RECEBIMENTOS)\b',
+        re.IGNORECASE,
+    )
+
+    # Linhas de saldo/cabeçalho a ignorar
+    _SKIP_HIST = frozenset([
+        'SALDO TOTAL DISPONÍVEL DIA', 'SALDO ANTERIOR',
+        'DATA LANÇAMENTOS', 'VALOR (R$)', 'SALDO (R$)',
+    ])
+
+    # Remove CNPJ (00.000.000/0000-00) ou CPF (000.000.000-00) do final do desc
+    _CNPJ_TRAIL = re.compile(
+        r'\s+\d{2,3}[\d.]{5,}\d[-/]\d{4,6}-\d{2}\s*$'
+    )
+
+    def parse(self, full_text: str) -> ParseResult:
+        self._result = ParseResult(banco="itau")
+        lines = full_text.split('\n')
+        total = len(lines)
+        # Estima páginas contando ocorrências de "Agência" no cabeçalho
+        pages = max(1, full_text.count('Agência'))
+        self._result.total_linhas_pdf = total
+
+        linhas_capturadas: set = set()
+        pending: List[str] = []  # fragmentos de continuação acumulados
+
+        for line_num, raw_line in enumerate(lines, start=1):
+            line = raw_line.rstrip()
+            if not line.strip():
+                continue
+
+            # ── Linha âncora (tem data) ───────────────────────────────────────
+            a = self._ANCHOR_RE.match(line)
+            if a:
+                date_str = a.group(1)          # DD/MM/AAAA completo
+                rest     = a.group(2).strip()
+
+                # Ignora linhas de saldo e cabeçalho
+                if any(s in rest.upper() for s in self._SKIP_HIST):
+                    linhas_capturadas.add(line_num)
+                    pending = []
+                    continue
+
+                # Extrai valor (último token numérico, possivelmente negativo)
+                vm = re.search(r'(-?[\d.,]+)\s*$', rest)
+                if not vm:
+                    self._skip(line_num, line,
+                               "Linha âncora sem valor numérico detectável",
+                               total, pages)
+                    pending = []
+                    continue
+
+                linhas_capturadas.add(line_num)
+                valor_str = vm.group(1)
+                desc_raw  = rest[:vm.start()].strip()
+
+                # Remove CNPJ/CPF do final do desc_raw
+                desc_raw = self._CNPJ_TRAIL.sub('', desc_raw).strip()
+                # Segunda passagem para CPF simples que ficou residual
+                desc_raw = re.sub(
+                    r'\s+\d{3}\.\d{3}\.\d{3}-\d{2}\s*$', '', desc_raw
+                ).strip()
+                desc_raw = re.sub(
+                    r'\s+\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\s*$', '', desc_raw
+                ).strip()
+
+                # ── Escolha da melhor descrição ───────────────────────────────
+                if self._KEYWORD_RE.match(desc_raw):
+                    # A própria linha âncora tem uma descrição de transação
+                    desc = desc_raw
+                else:
+                    # Procura no pending a última entrada que começa com keyword
+                    kw_candidates = [
+                        p for p in pending if self._KEYWORD_RE.match(p)
+                    ]
+                    if kw_candidates:
+                        desc = kw_candidates[-1]
+                    elif desc_raw:
+                        desc = desc_raw
+                    else:
+                        desc = ' '.join(pending[:3]) if pending else '(sem descrição)'
+
+                # ── Conversão do valor ────────────────────────────────────────
+                negativo = valor_str.startswith('-')
+                valor = parse_valor_br(valor_str.lstrip('-'))
+                if valor is None:
+                    self._skip(line_num, line,
+                               f"Valor inválido: {valor_str!r}",
+                               total, pages)
+                    pending = []
+                    continue
+
+                self._result.lancamentos.append(Lancamento(
+                    data=date_str,
+                    descricao=self._clean_description(desc),
+                    debito=valor  if negativo else None,
+                    credito=valor if not negativo else None,
+                ))
+                pending = []
+                continue
+
+            # ── Linha de continuação (sem data) ──────────────────────────────
+            c = self._CONT_RE.match(line)
+            if c:
+                pending.append(c.group(1).strip())
+
+        # Pós-processamento: detecta padrões data+valor que escaparam
+        self._varredura_pos_processamento(lines, linhas_capturadas, pages)
+
+        log.debug(
+            f"Itaú: {self._result.total_lancamentos} lançamentos, "
+            f"{self._result.total_ignoradas} ignoradas."
+        )
+        return self._result
+
+
 # ── Registro global ───────────────────────────────────────────────────────────
 
 PARSERS: Dict[str, Type[BankParser]] = {
+    "itau":      ItauParser,       # Itaú antes dos outros (assinaturas únicas)
     "santander": SantanderParser,
     "bb":        BancoBrasilParser,
     "sicoob":    SicoobParser,

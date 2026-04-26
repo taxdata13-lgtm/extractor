@@ -304,6 +304,7 @@ def process_pdf(uploaded_file) -> tuple:
 
 
 BANCO_LABELS = {
+    "itau":      ("🟠", "Itaú"),
     "sicoob":    ("🏦", "Sicoob"),
     "santander": ("🔴", "Santander"),
     "bb":        ("⭐", "Banco do Brasil"),
@@ -331,9 +332,9 @@ st.markdown("""
             <div class="bank-icon">⭐</div>
             <div class="bank-name">Banco do Brasil</div>
         </div>
-        <div class="bank-card" style="opacity:0.45;">
-            <div class="bank-icon">➕</div>
-            <div class="bank-name">Em breve...</div>
+        <div class="bank-card">
+            <div class="bank-icon">🟠</div>
+            <div class="bank-name">Itaú</div>
         </div>
     </div>
 </div>
