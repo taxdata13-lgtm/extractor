@@ -752,6 +752,168 @@ class ItauParser(BankParser):
         return self._result
 
 
+# ── Sicredi ───────────────────────────────────────────────────────────────────
+
+class SicrediParser(BankParser):
+    """
+    Parser para extratos do Sicredi (Cooperativa de Crédito).
+
+    Layout das colunas (pdfplumber extract_text):
+        DD/MM/AAAA  Descrição  [Documento]  Valor (R$)  Saldo (R$)
+
+    Peculiaridades tratadas:
+      • pdfplumber pode inserir aspas (") e vírgulas extras — limpeza prévia.
+      • A coluna Documento é opcional (ex: "PIX_CRED", "PIX_DEB", "CAPTACAO",
+        número de cheque) e aparece entre a descrição e o valor.
+      • O Saldo ocupa sempre a última coluna BRL da linha — descartamos ele
+        e usamos o penúltimo token BRL como Valor da transação.
+      • Valores prefixados com '-' → DÉBITO.
+      • Valores sem prefixo '-' → CRÉDITO.
+      • Linhas de controle (SALDO ANTERIOR, APLICACAO FINANCEIRA, RESG.APLIC.,
+        LANÇAMENTOS FUTUROS) são ignoradas silenciosamente.
+    """
+
+    BANK_SIGNATURES = ["Sicredi", "Cooperativa:"]
+
+    # Linha âncora: data DD/MM/AAAA no início (após limpeza)
+    _ANCHOR_RE = re.compile(r'^(\d{2}/\d{2}/\d{4})\s+(.*)')
+
+    # Token BRL: sinal opcional + dígitos + separadores BR + 2 decimais
+    # Ex: 13.018,56  -34.704,99  0,00  326.599,93
+    _BRL_TOKEN_RE = re.compile(r'-?(?:\d{1,3})(?:\.\d{3})*,\d{2}')
+
+    # Linhas de controle/saldo que devem ser ignoradas silenciosamente
+    _SKIP_RE = re.compile(
+        r'SALDO\s+ANTERIOR'
+        r'|APLICACAO\s+FINANCEIRA'
+        r'|RESG\.APLIC\.'
+        r'|LANÇAMENTOS\s+FUTUROS'
+        r'|LAN[ÇC]AMENTOS\s+FUTUROS'
+        r'|Valores\s+das\s+opera'        # rodapé
+        r'|Sicredi\s+Fone'               # rodapé
+        r'|SAC\s+0800'                   # rodapé
+        r'|Ouvidoria'                    # rodapé
+        r'|Associado:'                   # cabeçalho
+        r'|Cooperativa:'                 # cabeçalho
+        r'|Conta:'                       # cabeçalho
+        r'|Extrato\s+\(Per'              # cabeçalho
+        r'|Data\s+Descri'                # cabeçalho de coluna
+        r'|DEB\.CTA\.FATURA.*-\d'        # fatura cartão já é lançamento real, tratado abaixo
+        r'|CESTA\s+EMPRESARIAL',         # taxa, tratada como lançamento real
+        re.IGNORECASE,
+    )
+
+    # Excepções: linhas que coincidem com _SKIP_RE mas SÃO lançamentos reais
+    _KEEP_RE = re.compile(
+        r'DEB\.CTA\.FATURA|CESTA\s+(?:DE\s+)?RELACIONAMENTO|CESTA\s+EMPRESARIAL',
+        re.IGNORECASE,
+    )
+
+    # Cabeçalhos de coluna / linhas sem valor monetário a ignorar
+    _HEADER_WORDS = frozenset([
+        'SALDO ANTERIOR', 'DATA', 'DESCRIÇÃO', 'DOCUMENTO', 'VALOR (R$)', 'SALDO (R$)',
+    ])
+
+    @staticmethod
+    def _clean_line(raw: str) -> str:
+        """Remove aspas, vírgulas espúrias e normaliza espaços."""
+        line = raw.replace('"', ' ')
+        # Vírgulas fora de contexto numérico (artefatos CSV-like)
+        line = re.sub(r',(?!\d{2}\b)', ' ', line)
+        line = re.sub(r'[ \t]+', ' ', line)
+        return line.strip()
+
+    def parse(self, full_text: str) -> ParseResult:
+        self._result = ParseResult(banco="sicredi")
+        raw_lines = full_text.split('\n')
+        total = len(raw_lines)
+        self._result.total_linhas_pdf = total
+        pages = max(1, full_text.count('\f') + 1)
+
+        linhas_capturadas: set = set()
+
+        for line_num, raw_line in enumerate(raw_lines, start=1):
+
+            # ── Passo 1: limpeza de artefatos ─────────────────────────────────
+            line = self._clean_line(raw_line)
+
+            if not line:
+                continue
+
+            # ── Passo 2: ignora cabeçalhos / rodapés / linhas de saldo ────────
+            # Exceto linhas que são lançamentos reais (DEB.CTA.FATURA etc.)
+            if self._SKIP_RE.search(line) and not self._KEEP_RE.search(line):
+                continue
+
+            # ── Passo 3: filtra apenas linhas âncora (data no início) ─────────
+            m = self._ANCHOR_RE.match(line)
+            if not m:
+                continue
+
+            date_str = m.group(1)        # DD/MM/AAAA
+            rest     = m.group(2).strip()
+
+            linhas_capturadas.add(line_num)
+
+            # ── Passo 4: extrai todos os tokens BRL da linha ──────────────────
+            brl_tokens = self._BRL_TOKEN_RE.findall(rest)
+            if not brl_tokens:
+                self._skip(line_num, line,
+                           "Linha com data mas sem valor BRL detectável",
+                           total, pages)
+                continue
+
+            # Layout: ... Valor  Saldo
+            # Penúltimo token = Valor; Último = Saldo (descartado)
+            # Se só há 1 token, ele é o Valor (linha sem saldo explícito)
+            if len(brl_tokens) >= 2:
+                valor_str = brl_tokens[-2]
+            else:
+                valor_str = brl_tokens[-1]
+
+            # ── Passo 5: extrai descrição ─────────────────────────────────────
+            # Tudo antes do primeiro token BRL é "descrição + possível documento"
+            primeiro_brl_pos = self._BRL_TOKEN_RE.search(rest).start()
+            desc_raw = rest[:primeiro_brl_pos].strip()
+
+            # Remove token de documento do final da descrição:
+            # - identificadores como PIX_CRED, PIX_DEB, CAPTACAO
+            # - códigos numéricos (ex: "817515", "262058176")
+            desc_raw = re.sub(r'\s+PIX_(?:CRED|DEB)\s*$', '', desc_raw, flags=re.IGNORECASE)
+            desc_raw = re.sub(r'\s+CAPTACAO\s*$', '', desc_raw, flags=re.IGNORECASE)
+            desc_raw = re.sub(r'\s+\d{5,}\s*$', '', desc_raw)
+            desc = self._clean_description(desc_raw)
+
+            if not desc or desc.upper() in self._HEADER_WORDS:
+                continue  # cabeçalho de coluna — não é erro
+
+            # ── Passo 6: converte valor e determina natureza ──────────────────
+            negativo = valor_str.startswith('-')
+            valor = parse_valor_br(valor_str.lstrip('-'))
+
+            if valor is None:
+                self._skip(line_num, line,
+                           f"Valor inválido não pôde ser convertido: {valor_str!r}",
+                           total, pages)
+                continue
+
+            self._result.lancamentos.append(Lancamento(
+                data=date_str,
+                descricao=desc,
+                debito=valor  if negativo else None,
+                credito=valor if not negativo else None,
+            ))
+
+        # Pós-processamento: detecta padrões data+valor que escaparam
+        self._varredura_pos_processamento(raw_lines, linhas_capturadas, pages)
+
+        log.debug(
+            f"Sicredi: {self._result.total_lancamentos} lançamentos, "
+            f"{self._result.total_ignoradas} ignoradas."
+        )
+        return self._result
+
+
 # ── Registro global ───────────────────────────────────────────────────────────
 
 PARSERS: Dict[str, Type[BankParser]] = {
@@ -759,6 +921,7 @@ PARSERS: Dict[str, Type[BankParser]] = {
     "santander": SantanderParser,
     "bb":        BancoBrasilParser,
     "sicoob":    SicoobParser,
+    "sicredi":   SicrediParser,
 }
 
 

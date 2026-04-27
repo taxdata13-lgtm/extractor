@@ -288,7 +288,7 @@ def process_pdf(uploaded_file) -> tuple:
     if not banco_key:
         raise ValueError(
             "Banco não identificado automaticamente. "
-            "Por ora são suportados: Santander, Banco do Brasil e Sicoob."
+            "Por ora são suportados: Santander, Banco do Brasil, Sicoob e Sicredi."
         )
 
     parser = PARSERS[banco_key]()
@@ -308,6 +308,7 @@ BANCO_LABELS = {
     "sicoob":    ("🏦", "Sicoob"),
     "santander": ("🔴", "Santander"),
     "bb":        ("⭐", "Banco do Brasil"),
+    "sicredi":   ("🟢", "Sicredi"),
 }
 
 
@@ -323,6 +324,10 @@ st.markdown("""
         <div class="bank-card">
             <div class="bank-icon">🏦</div>
             <div class="bank-name">Sicoob</div>
+        </div>
+        <div class="bank-card">
+            <div class="bank-icon">🟢</div>
+            <div class="bank-name">Sicredi</div>
         </div>
         <div class="bank-card">
             <div class="bank-icon">🔴</div>
@@ -358,7 +363,7 @@ uploaded_files = st.file_uploader(
     type=["pdf"],
     accept_multiple_files=True,
     label_visibility="collapsed",
-    help="Suportado: extratos do Sicoob (Internet Banking), Santander e Banco do Brasil.",
+    help="Suportados: Sicoob, Sicredi, Santander, Banco do Brasil e Itaú.",
 )
 st.markdown('</div>', unsafe_allow_html=True)
 
