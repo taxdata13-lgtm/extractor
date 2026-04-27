@@ -261,74 +261,150 @@ class SicoobParser(BankParser):
 
 class SantanderParser(BankParser):
     """
-    Parser para extratos do Banco Santander.
+    Parser para extratos do Santander Empresarial (Internet Banking PDF).
 
-    Layout: DD/MM/AAAA  DESCRIÇÃO  1.234,56 D
+    Layout real das colunas:
+        Data | Histórico | Documento | Valor (R$) | Saldo (R$)
+
+    Peculiaridades tratadas:
+      • pdfplumber pode inserir aspas e vírgulas extras (artefatos CSV-like).
+      • A coluna Documento (ex: "000000", "001843") aparece entre o histórico
+        e o valor — pode ser omitida em algumas linhas.
+      • Débito  → valor prefixado com '-'  (ex: -52.855,00)
+      • Crédito → valor sem prefixo        (ex: 130,84)
+      • Linhas como SALDO ANTERIOR, RESGATE/APLICACAO CONTAMAX e o bloco de
+        sumário de saldo ao final do extrato são ignoradas intencionalmente.
+      • O saldo corrente (última coluna) às vezes aparece na mesma linha;
+        é descartado — capturamos sempre a penúltima ocorrência de valor BRL.
+
+    Estratégia:
+      1. Limpa aspas e normaliza espaços em cada linha.
+      2. Identifica linhas âncora pelo padrão DD/MM/AAAA no início.
+      3. Extrai todos os tokens BRL da linha e usa o PENÚLTIMO (ou último,
+         quando só há um) como Valor — o último seria o Saldo.
+      4. Determina Débito/Crédito pelo sinal do Valor.
+      5. A descrição é tudo entre a data e o primeiro token BRL, após remover
+         o token de Documento (6 dígitos numéricos tipo "000000" ou cheque).
     """
 
-    BANK_SIGNATURES = ["SANTANDER", "BANCO SANTANDER"]
+    BANK_SIGNATURES = ["SANTANDER", "BANCO SANTANDER", "Internet Banking Empresarial"]
 
-    _LINE_RE = re.compile(
-        r'(\d{2}/\d{2}/\d{2,4})\s+(.+?)\s+([\d.,]+)\s*([DCdc])\b',
-        re.MULTILINE,
+    # Ancora a linha: inicia com DD/MM/AAAA (data completa)
+    _ANCHOR_RE = re.compile(r'^(\d{2}/\d{2}/\d{4})\s+(.*)')
+
+    # Token de valor monetário brasileiro: opcional '-', dígitos, ponto-milhar, vírgula-decimal
+    # Ex: 130,84  -52.855,00  8.398,49  112.490,00
+    _BRL_TOKEN_RE = re.compile(r'-?(?:\d{1,3})(?:\.\d{3})*,\d{2}')
+
+    # Documento: sequência de 5-6 dígitos sozinha (ex: "000000", "001843", "010106")
+    _DOC_TOKEN_RE = re.compile(r'\b\d{5,6}\b')
+
+    # Descrições que NÃO devem gerar lançamento (são entradas de saldo/controle)
+    _SKIP_DESCS = (
+        'SALDO ANTERIOR',
+        'RESGATE CONTAMAX',
+        'APLICACAO CONTAMAX',
+        'SALDO EM INVESTIMENTOS',
+        'SALDO DISPONIVEL',
     )
 
-    # Detecta linhas com data + valor mas sem indicador D/C — podem ser erros
-    _SUSPEITA_RE = re.compile(
-        r'(\d{2}/\d{2}/\d{2,4})\s+.+?\s+([\d.,]+)\s*$',
-        re.MULTILINE,
+    # Linhas que marcam o início do bloco de sumário (fim do extrato real).
+    # Padrões escolhidos para NÃO disparar na linha de header "Saldo disponível para uso:".
+    _SUMMARY_RE = re.compile(
+        r'Saldo\s+em\s+Investimentos\s+com'  # "Saldo em Investimentos com Resgate..."
+        r'|^[A-H]\s+-\s+Saldo'              # "A - Saldo de Conta Corrente"
+        r'|Posição\s+em:'                    # "Posição em: 04/03/2026"
+        r'|Central\s+de\s+Atendimento'       # rodapé
+        r'|a\s*=\s*Bloqueio',               # legenda de rodapé
+        re.IGNORECASE | re.MULTILINE,
     )
 
     def parse(self, full_text: str) -> ParseResult:
         self._result = ParseResult(banco="santander")
-        lines = full_text.split('\n')
-        self._result.total_linhas_pdf = len(lines)
+        raw_lines = full_text.split('\n')
+        total = len(raw_lines)
+        self._result.total_linhas_pdf = total
         pages = max(1, full_text.count('\f') + 1)
 
-        capturadas_spans = set()
+        linhas_capturadas: set = set()
+        in_summary = False  # flag: chegamos ao bloco de saldo/sumário
 
-        for m in self._LINE_RE.finditer(full_text):
-            capturadas_spans.add(m.start())
-            data = self._normalize_date(m.group(1))
-            desc = self._clean_description(m.group(2))
-            valor = parse_valor_br(m.group(3))
-            nat = m.group(4)
+        for line_num, raw_line in enumerate(raw_lines, start=1):
+
+            # ── Passo 1: limpeza de artefatos CSV-like ────────────────────────
+            line = raw_line.replace('"', ' ')           # remove aspas
+            line = re.sub(r'[ \t]+', ' ', line).strip() # normaliza espaços
+
+            if not line:
+                continue
+
+            # ── Detecta início do bloco de sumário (para o processamento) ─────
+            if self._SUMMARY_RE.search(line):
+                in_summary = True
+            if in_summary:
+                continue
+
+            # ── Passo 2: filtra apenas linhas âncora (começam com data) ───────
+            m_anchor = self._ANCHOR_RE.match(line)
+            if not m_anchor:
+                continue
+
+            date_str = m_anchor.group(1)           # "DD/MM/AAAA"
+            rest     = m_anchor.group(2).strip()   # tudo após a data
+
+            linhas_capturadas.add(line_num)
+
+            # ── Passo 3: extrai todos os tokens BRL da linha ──────────────────
+            brl_tokens = self._BRL_TOKEN_RE.findall(rest)
+            if not brl_tokens:
+                self._skip(line_num, line,
+                           "Linha com data mas sem valor BRL detectável",
+                           total, pages)
+                continue
+
+            # O layout tem: histórico | [doc] | Valor | [Saldo]
+            # Queremos o penúltimo token BRL quando há 2+, ou o único quando há 1.
+            if len(brl_tokens) >= 2:
+                valor_str = brl_tokens[-2]  # penúltimo = Valor; último = Saldo
+            else:
+                valor_str = brl_tokens[-1]  # só um token: é o Valor (sem saldo na linha)
+
+            # ── Passo 4: extrai a descrição ───────────────────────────────────
+            # Tudo antes do primeiro token BRL é "histórico + possível documento"
+            primeiro_brl_pos = self._BRL_TOKEN_RE.search(rest).start()
+            desc_raw = rest[:primeiro_brl_pos].strip()
+
+            # Remove token de Documento (5-6 dígitos no final do trecho de desc)
+            desc_raw = self._DOC_TOKEN_RE.sub('', desc_raw)
+            desc = self._clean_description(desc_raw)
+
+            # ── Passo 5: verifica se deve ignorar ─────────────────────────────
+            if not desc or any(skip in desc.upper() for skip in self._SKIP_DESCS):
+                # Não gera lançamento, mas não é erro — marca como capturada
+                continue
+
+            # ── Passo 6: converte valor e determina natureza ──────────────────
+            negativo = valor_str.startswith('-')
+            valor = parse_valor_br(valor_str.lstrip('-'))
 
             if valor is None:
-                # Localiza a linha para o relatório
-                linha_num = full_text[:m.start()].count('\n') + 1
-                self._skip(
-                    linha_num, m.group(0),
-                    f"Valor inválido: {m.group(3)!r}",
-                    len(lines), pages,
-                )
+                self._skip(line_num, line,
+                           f"Valor inválido não pôde ser convertido: {valor_str!r}",
+                           total, pages)
                 continue
 
             self._result.lancamentos.append(Lancamento(
-                data=data, descricao=desc,
-                debito=valor if is_debito(nat) else None,
-                credito=valor if is_credito(nat) else None,
+                data=date_str,
+                descricao=desc,
+                debito=valor  if negativo else None,
+                credito=valor if not negativo else None,
             ))
 
-        # Busca padrões suspeitos não capturados
-        for m in self._SUSPEITA_RE.finditer(full_text):
-            if m.start() not in capturadas_spans:
-                linha_num = full_text[:m.start()].count('\n') + 1
-                self._skip(
-                    linha_num, m.group(0).strip(),
-                    "Padrão detectado mas não capturado (sem indicador D/C?)",
-                    len(lines), pages,
-                )
-
-        log.debug(f"Santander: {self._result.total_lancamentos} lançamentos, {self._result.total_ignoradas} ignoradas.")
+        log.debug(
+            f"Santander: {self._result.total_lancamentos} lançamentos, "
+            f"{self._result.total_ignoradas} ignoradas."
+        )
         return self._result
-
-    @staticmethod
-    def _normalize_date(date_str: str) -> str:
-        p = date_str.split('/')
-        if len(p[2]) == 2:
-            p[2] = '20' + p[2]
-        return '/'.join(p)
 
 
 # ── Banco do Brasil ───────────────────────────────────────────────────────────
