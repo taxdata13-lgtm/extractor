@@ -335,47 +335,190 @@ class SantanderParser(BankParser):
 
 class BancoBrasilParser(BankParser):
     """
-    Parser para extratos do Banco do Brasil.
+    Parser para extratos do Banco do Brasil (Internet Banking / Consultas).
 
-    Layout: DD/MM/AAAA  DESCRIÇÃO  -1.234,56  (negativo = débito)
+    Layout real do PDF (pdfplumber layout=True):
+        DD/MM/AAAA   0000   LOTE   COD   Histórico [complemento]   DOC   VALOR [D|C]   SALDO [D|C]
+
+    Estratégia linha-a-linha:
+      1. Filtra linhas que começam com DD/MM/AAAA (data de balancete).
+      2. Extrai o ÚLTIMO token numérico+D/C antes do saldo, que é o VALOR da
+         transação.  O saldo (coluna final) é descartado.
+      3. Tudo entre a data e o valor é tratado como descrição (após limpeza).
+      4. Linhas de continuação (sem data) que contêm a Razão Social / CNPJ do
+         beneficiário são coletadas e anexadas à descrição do lançamento anterior.
+      5. Linhas de saldo (Saldo Anterior, BB Rende Fácil, S A L D O final) são
+         ignoradas intencionalmente — não são erros.
+
+    Identificação de débito/crédito:
+      O BB usa sufixo 'D' (débito) ou 'C' (crédito) após cada valor e após o
+      saldo.  Capturamos o indicador D/C do VALOR (primeira ocorrência antes do
+      saldo).
     """
 
-    BANK_SIGNATURES = ["BANCO DO BRASIL", "BB S.A.", "BANCO DO BRASIL S.A"]
+    BANK_SIGNATURES = [
+        "BANCO DO BRASIL",
+        "BB S.A.",
+        "BANCO DO BRASIL S.A",
+        "Consultas - Extrato de conta corrente",  # título do PDF web
+        "G3310410",                               # código de geração BB
+    ]
 
-    _LINE_RE = re.compile(
-        r'(\d{2}/\d{2}/\d{2,4})\s+(.+?)\s+(-?[\d.,]+)\s*$',
-        re.MULTILINE,
+    # Linha âncora: indentação variável + data DD/MM/AAAA + resto
+    _ANCHOR_DATE_RE = re.compile(r'^\s+(\d{2}/\d{2}/\d{2,4})\s+(.*)')
+
+    # Valor monetário real com indicador D/C no final da linha.
+    # Padrão BR: opcional sinal + grupos de até 3 dígitos separados por ponto + vírgula + 2 decimais
+    # Ex: "57,82 C"  "13.786,09 C"  "130.787,23 C"  "141.818,25 D"
+    # NÃO deve casar com: "340.516.634.007.704" (número de documento)
+    _VALOR_DC_RE = re.compile(
+        r'(-?(?:\d{1,3})(?:\.\d{3})*,\d{2})\s+([DC])'  # valor monetário BR + D/C
+        r'(?:\s+(?:\d{1,3})(?:\.\d{3})*,\d{2}\s+[DC])?' # saldo opcional (descartado)
+        r'\s*$'
     )
+
+    # Linhas de saldo/cabeçalho que devem ser ignoradas silenciosamente
+    _SKIP_RE = re.compile(
+        r'Saldo\s+Anterior|BB\s+Rende\s+F[áa]cil|Rende\s+Facil'
+        r'|S\s*A\s*L\s*D\s*O\b'
+        r'|Dt\.\s*balancete|Dt\.\s*movimento'
+        r'|Lan[çc]amentos'
+        r'|Ag[êe]ncia\s+\d'
+        r'|Conta\s+corrente'
+        r'|Per[íi]odo\s+do\s+extrato'
+        r'|Cliente\s*-|Consultas\s*-'
+        r'|Servi[çc]o\s+de\s+Atendimento'
+        r'|Transa[çc][ãa]o\s+efetuada'
+        r'|Ouvidoria'
+        r'|Hist[óo]rico\s+Documento'
+        r'|Valor\s+R\$',
+        re.IGNORECASE,
+    )
+
+    # Detecta se a linha de continuação contém apenas dígitos/separadores (ruído)
+    _ONLY_DIGITS_RE = re.compile(r'^[\d\s./\-]+$')
 
     def parse(self, full_text: str) -> ParseResult:
         self._result = ParseResult(banco="bb")
         lines = full_text.split('\n')
-        self._result.total_linhas_pdf = len(lines)
-        pages = max(1, full_text.count('\f') + 1)
+        total = len(lines)
+        self._result.total_linhas_pdf = total
 
-        for m in self._LINE_RE.finditer(full_text):
-            data = self._normalize_date(m.group(1))
-            desc = self._clean_description(m.group(2))
-            raw_valor = m.group(3).strip()
-            negativo = raw_valor.startswith('-')
-            valor = parse_valor_br(raw_valor.lstrip('-'))
+        # Estima páginas pelo número de cabeçalhos de data no topo ou form feeds
+        pages = max(1, full_text.count('\f') + full_text.count('G3310'))
 
-            if valor is None:
-                linha_num = full_text[:m.start()].count('\n') + 1
-                self._skip(
-                    linha_num, m.group(0).strip(),
-                    f"Valor inválido: {raw_valor!r}",
-                    len(lines), pages,
-                )
+        # ── Debug: exibe as primeiras 10 linhas brutas para diagnóstico ────────
+        log.debug("=== BB RAW (primeiras 10 linhas) ===")
+        for i, l in enumerate(lines[:10], 1):
+            log.debug(f"  [{i:>3}] {l!r}")
+        log.debug("=====================================")
+
+        pending_lancamento: Optional[Lancamento] = None
+        pending_line_num: int = 0
+
+        def _flush_pending() -> None:
+            """Confirma o lançamento pendente no resultado."""
+            if pending_lancamento is not None:
+                self._result.lancamentos.append(pending_lancamento)
+
+        for line_num, raw_line in enumerate(lines, start=1):
+            line = raw_line.rstrip()
+
+            # ── Ignora linhas vazias ──────────────────────────────────────────
+            if not line.strip():
                 continue
 
-            self._result.lancamentos.append(Lancamento(
-                data=data, descricao=desc,
-                debito=valor if negativo else None,
-                credito=valor if not negativo else None,
-            ))
+            # ── Ignora cabeçalhos / rodapés / linhas de saldo ─────────────────
+            if self._SKIP_RE.search(line):
+                _flush_pending()
+                pending_lancamento = None
+                continue
 
-        log.debug(f"BB: {self._result.total_lancamentos} lançamentos, {self._result.total_ignoradas} ignoradas.")
+            # ── Linha âncora: começa com data DD/MM/AAAA ──────────────────────
+            m_anchor = self._ANCHOR_DATE_RE.match(line)
+            if m_anchor:
+                # Antes de processar nova âncora, confirma a pendente anterior
+                _flush_pending()
+                pending_lancamento = None
+
+                date_str = self._normalize_date(m_anchor.group(1))
+                rest = m_anchor.group(2).strip()
+
+                # Extrai valor + indicador D/C do final da linha
+                m_val = self._VALOR_DC_RE.search(rest)
+                if not m_val:
+                    # Linha começa com data mas não tem valor D/C reconhecível
+                    # Pode ser linha de cabeçalho ou layout desconhecido
+                    self._skip(
+                        line_num, line,
+                        "Linha com data mas sem valor D/C detectável",
+                        total, pages,
+                    )
+                    continue
+
+                raw_valor = m_val.group(1)   # ex: "13.786,09" ou "-80.000,00"
+                nat = m_val.group(2)          # "D" ou "C"
+
+                # Extrai descrição: tudo antes do par valor+D/C
+                desc_raw = rest[:m_val.start()].strip()
+
+                # Remove colunas numéricas prefixais do BB:
+                #   "0000  14397821  Pix-Recebido..."  →  "Pix-Recebido..."
+                # Formato: agência (4 dig) + espaços + lote+cod (7-8 dig) + espaço
+                desc_raw = re.sub(r'^\d{4}\s+\d{5,8}\s+', '', desc_raw).strip()
+
+                # Remove o número do documento do final (token numérico longo
+                # com pontos, ex: "10.818.552.213.311" ou "100.146.637")
+                # Esses aparecem APÓS o histórico e ANTES do valor
+                desc_raw = re.sub(r'\s+[\d.]{7,}\s*$', '', desc_raw).strip()
+
+                # Normaliza valor
+                negativo = raw_valor.startswith('-')
+                valor = parse_valor_br(raw_valor.lstrip('-'))
+
+                if valor is None:
+                    self._skip(
+                        line_num, line,
+                        f"Valor inválido não pôde ser convertido: {raw_valor!r}",
+                        total, pages,
+                    )
+                    continue
+
+                # Cria lançamento pendente (pode receber continuação)
+                pending_lancamento = Lancamento(
+                    data=date_str,
+                    descricao=self._clean_description(desc_raw) or "(sem descrição)",
+                    debito=valor  if (negativo or nat == 'D') else None,
+                    credito=valor if (not negativo and nat == 'C') else None,
+                )
+                pending_line_num = line_num
+                continue
+
+            # ── Linha de continuação: enriquece a descrição do lançamento ─────
+            if pending_lancamento is not None:
+                stripped = line.strip()
+                # Descarta linhas que são só dígitos/códigos numéricos
+                if stripped and not self._ONLY_DIGITS_RE.match(stripped):
+                    # Anexa à descrição apenas se não for ruído de layout
+                    # (evita duplicar o histórico principal)
+                    current = pending_lancamento.descricao
+                    if stripped.upper() not in current.upper():
+                        pending_lancamento = Lancamento(
+                            data=pending_lancamento.data,
+                            descricao=self._clean_description(
+                                f"{current} | {stripped}"
+                            ),
+                            debito=pending_lancamento.debito,
+                            credito=pending_lancamento.credito,
+                        )
+
+        # Confirma o último lançamento pendente
+        _flush_pending()
+
+        log.debug(
+            f"BB: {self._result.total_lancamentos} lançamentos, "
+            f"{self._result.total_ignoradas} ignoradas."
+        )
         return self._result
 
     @staticmethod
