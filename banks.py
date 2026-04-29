@@ -916,12 +916,210 @@ class SicrediParser(BankParser):
 
 # ── Registro global ───────────────────────────────────────────────────────────
 
+class BradescoParser(BankParser):
+    """
+    Parser para extratos do Bradesco Net Empresa.
+
+    Layout visual:
+        Data | Lancamento | Dcto. | Credito | Debito | Saldo
+
+    O texto extraido pelo pdfplumber costuma quebrar a descricao em linhas
+    proximas ao valor. Por isso o parser mantem um pequeno buffer de descricao
+    e finaliza cada lancamento somente quando encontra a proxima linha com
+    valor, separando complemento anterior da descricao do novo lancamento.
+    """
+
+    BANK_SIGNATURES = ["bradesco", "net empresa"]
+
+    _DATE_RE = re.compile(r'^\s*(\d{2}/\d{2}/\d{4})\s+(.*)$')
+    _BRL_TOKEN_RE = re.compile(r'-?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2}')
+
+    _MAIN_DESC_RE = re.compile(
+        r'^(LIQUIDACAO|RECEBIMENTO|TARIFA|PAGTO|PGTO|TRANSFERENCIA|'
+        r'CONTA|OPERACAO|TED-|TRANSF|APLIC|RESGATE|PIX|GASTOS|'
+        r'ENCARGOS|CHEQUE)\b',
+        re.IGNORECASE,
+    )
+
+    _SKIP_FRAGMENTS = (
+        'Extrato Mensal',
+        'Nome do usu',
+        'Data da opera',
+        'Folha',
+        'Agencia | Conta',
+        'Agência | Conta',
+        'Extrato de:',
+        'Data     Lanc',
+        'Data     Lanç',
+        'Data    Lanc',
+        'Data    Lanç',
+        'Data    Hist',
+        'Total Dispon',
+        'SALDO ANTERIOR',
+        'SALDO INVEST',
+        'Saldos Invest',
+        'Os dados acima',
+        'Ultimos Lanc',
+        'Últimos Lanç',
+    )
+
+    def parse(self, full_text: str) -> ParseResult:
+        self._result = ParseResult(banco="bradesco")
+        raw_lines = full_text.split('\n')
+        total = len(raw_lines)
+        self._result.total_linhas_pdf = total
+        pages = max(1, full_text.count('Folha'))
+
+        current_date: Optional[str] = None
+        buffer_desc: List[str] = []
+        pending: Optional[Lancamento] = None
+
+        def flush_pending(extra_parts: Optional[List[str]] = None) -> None:
+            nonlocal pending
+            if pending is None:
+                return
+            if extra_parts:
+                pending.descricao = self._join_description(
+                    [pending.descricao] + extra_parts
+                )
+            self._result.lancamentos.append(pending)
+            pending = None
+
+        for line_num, raw_line in enumerate(raw_lines, start=1):
+            line = self._clean_line(raw_line)
+            if not line:
+                continue
+
+            if self._is_skip_line(line):
+                if self._is_boundary_line(line):
+                    flush_pending(buffer_desc)
+                    buffer_desc = []
+                continue
+
+            date_match = self._DATE_RE.match(raw_line)
+            date_str = None
+            rest = raw_line
+            if date_match:
+                date_str = date_match.group(1)
+                rest = date_match.group(2)
+
+            value_matches = list(self._BRL_TOKEN_RE.finditer(rest))
+            if len(value_matches) < 2:
+                if not date_match:
+                    buffer_desc.append(line)
+                continue
+
+            if date_str:
+                current_date = date_str
+            if not current_date:
+                continue
+
+            value_match = value_matches[0]
+            valor_str = value_match.group(0)
+            row_desc = self._strip_document(rest[:value_match.start()])
+
+            previous_extra: List[str] = []
+            current_parts: List[str] = []
+            if row_desc:
+                if (
+                    buffer_desc
+                    and self._MAIN_DESC_RE.match(buffer_desc[-1])
+                    and not self._MAIN_DESC_RE.match(row_desc)
+                ):
+                    previous_extra = buffer_desc[:-1]
+                    current_parts = [buffer_desc[-1], row_desc]
+                else:
+                    previous_extra = buffer_desc
+                    current_parts = [row_desc]
+            else:
+                idx = self._last_main_description_index(buffer_desc)
+                if idx is None and buffer_desc:
+                    idx = len(buffer_desc) - 1
+                if idx is not None:
+                    previous_extra = buffer_desc[:idx]
+                    current_parts = buffer_desc[idx:]
+
+            flush_pending(previous_extra)
+            buffer_desc = []
+
+            valor = parse_valor_br(valor_str.lstrip('-'))
+            if valor is None:
+                self._skip(
+                    line_num, line,
+                    f"Valor invalido nao pode ser convertido: {valor_str!r}",
+                    total, pages,
+                )
+                continue
+
+            desc = self._join_description(current_parts) or "(sem descricao)"
+            pending = Lancamento(
+                data=current_date,
+                descricao=desc,
+                debito=valor if valor_str.startswith('-') else None,
+                credito=valor if not valor_str.startswith('-') else None,
+            )
+
+        flush_pending(buffer_desc)
+
+        log.debug(
+            f"Bradesco: {self._result.total_lancamentos} lancamentos, "
+            f"{self._result.total_ignoradas} ignoradas."
+        )
+        return self._result
+
+    @classmethod
+    def _is_skip_line(cls, line: str) -> bool:
+        return (
+            any(fragment.lower() in line.lower() for fragment in cls._SKIP_FRAGMENTS)
+            or re.match(r'^Total\b', line, re.IGNORECASE) is not None
+        )
+
+    @staticmethod
+    def _is_boundary_line(line: str) -> bool:
+        return (
+            re.match(r'^Total\b', line, re.IGNORECASE) is not None
+            or 'Saldos Invest' in line
+            or 'Os dados acima' in line
+        )
+
+    @staticmethod
+    def _clean_line(raw: str) -> str:
+        line = raw.replace('"', ' ')
+        return re.sub(r'\s+', ' ', line).strip()
+
+    @classmethod
+    def _strip_document(cls, raw_desc: str) -> str:
+        desc = raw_desc.strip()
+        if not re.search(r'[A-Za-zÀ-ÿ]', desc):
+            return ''
+
+        desc = re.sub(r'\s{2,}\S+$', '', desc).strip()
+        if (
+            re.search(r'\s\d{1,9}$', desc)
+            and len(re.findall(r'[A-Za-zÀ-ÿ]+', desc)) >= 2
+        ):
+            desc = re.sub(r'\s\d{1,9}$', '', desc).strip()
+        return cls._clean_line(desc)
+
+    @classmethod
+    def _join_description(cls, parts: List[str]) -> str:
+        return cls._clean_line(' - '.join(part for part in parts if part))
+
+    @classmethod
+    def _last_main_description_index(cls, parts: List[str]) -> Optional[int]:
+        for idx in range(len(parts) - 1, -1, -1):
+            if cls._MAIN_DESC_RE.match(parts[idx]):
+                return idx
+        return None
+
+
 PARSERS: Dict[str, Type[BankParser]] = {
     "itau":      ItauParser,       # Itaú antes dos outros (assinaturas únicas)
     "santander": SantanderParser,
     "bb":        BancoBrasilParser,
     "sicoob":    SicoobParser,
     "sicredi":   SicrediParser,
+    "bradesco":  BradescoParser,
 }
 
 
