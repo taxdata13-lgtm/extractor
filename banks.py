@@ -411,185 +411,281 @@ class SantanderParser(BankParser):
 
 class BancoBrasilParser(BankParser):
     """
-    Parser para extratos do Banco do Brasil (Internet Banking / Consultas).
+    Parser para extratos do Banco do Brasil (Internet Banking).
 
-    Layout real do PDF (pdfplumber layout=True):
-        DD/MM/AAAA   0000   LOTE   COD   Histórico [complemento]   DOC   VALOR [D|C]   SALDO [D|C]
+    Layout real gerado pelo pdfplumber (layout=True) para o extrato
+    "Extrato de Conta Corrente BB":
 
-    Estratégia linha-a-linha:
-      1. Filtra linhas que começam com DD/MM/AAAA (data de balancete).
-      2. Extrai o ÚLTIMO token numérico+D/C antes do saldo, que é o VALOR da
-         transação.  O saldo (coluna final) é descartado.
-      3. Tudo entre a data e o valor é tratado como descrição (após limpeza).
-      4. Linhas de continuação (sem data) que contêm a Razão Social / CNPJ do
-         beneficiário são coletadas e anexadas à descrição do lançamento anterior.
-      5. Linhas de saldo (Saldo Anterior, BB Rende Fácil, S A L D O final) são
-         ignoradas intencionalmente — não são erros.
+        Linha A (âncora de data):
+            "    02/01/2026                                                      "
+            — contém apenas a data; o restante da linha está em branco.
 
-    Identificação de débito/crédito:
-      O BB usa sufixo 'D' (débito) ou 'C' (crédito) após cada valor e após o
-      saldo.  Capturamos o indicador D/C do VALOR (primeira ocorrência antes do
-      saldo).
+        Linha B (detalhe da transação):
+            "             14397   11712399037412  01/01 17:12 ... ANDREIA BEL 160,00 (+)"
+            — sem data; contém lote, documento, histórico e valor.
+
+        Ou, em alguns lançamentos (BB Rende Fácil, Saldo do dia), a data
+        já aparece na mesma linha que um histórico sem valor.
+
+    Estratégia:
+      1. Ao encontrar linha com APENAS uma data DD/MM/AAAA (sem valor),
+         registra a data como "data corrente" e aguarda a próxima linha de detalhe.
+      2. Linha de detalhe (sem data, com valor `x,xx (+/-)` no final):
+         extrai lote, documento, histórico e valor. Usa a data corrente.
+      3. Linhas de descrição complementar (ex: "Pix - Recebido") que aparecem
+         ANTES da linha de detalhe são coletadas e usadas como tipo de histórico.
+      4. Suporte a layout legado D/C via fallback.
+      5. Linhas de saldo, cabeçalho e rodapé são descartadas silenciosamente.
     """
 
     BANK_SIGNATURES = [
         "BANCO DO BRASIL",
         "BB S.A.",
         "BANCO DO BRASIL S.A",
-        "Consultas - Extrato de conta corrente",  # título do PDF web
-        "G3310410",                               # código de geração BB
+        "Extrato de Conta Corrente BB",
+        "Consultas - Extrato de conta corrente",
+        "G3310410",
     ]
 
-    # Linha âncora: indentação variável + data DD/MM/AAAA + resto
-    _ANCHOR_DATE_RE = re.compile(r'^\s+(\d{2}/\d{2}/\d{2,4})\s+(.*)')
+    # Linha que contém APENAS uma data (e espaços)
+    _DATE_ONLY_RE = re.compile(r'^\s*(\d{2}/\d{2}/\d{4})\s*$')
 
-    # Valor monetário real com indicador D/C no final da linha.
-    # Padrão BR: opcional sinal + grupos de até 3 dígitos separados por ponto + vírgula + 2 decimais
-    # Ex: "57,82 C"  "13.786,09 C"  "130.787,23 C"  "141.818,25 D"
-    # NÃO deve casar com: "340.516.634.007.704" (número de documento)
-    _VALOR_DC_RE = re.compile(
-        r'(-?(?:\d{1,3})(?:\.\d{3})*,\d{2})\s+([DC])'  # valor monetário BR + D/C
-        r'(?:\s+(?:\d{1,3})(?:\.\d{3})*,\d{2}\s+[DC])?' # saldo opcional (descartado)
+    # Linha de detalhe: SEM data no início, COM valor (+/-) no final
+    # Ex: "   14397  11712399037412  01/01 17:12 ... ANDREIA BEL 160,00 (+)"
+    _DETAIL_RE = re.compile(
+        r'^\s+'                                      # indentação (sem data)
+        r'(?:\d{4,5}\s+)?'                           # lote opcional
+        r'(?:\d{4,15}\s+)?'                          # documento opcional
+        r'(.+?)\s+'                                  # histórico (capturado)
+        r'((?:\d{1,3})(?:\.\d{3})*,\d{2})\s+'       # valor BR
+        r'\(([+\-])\)\s*$'                           # indicador (+/-)
+    )
+
+    # Fallback: linha de detalhe com sufixo D/C (layout legado)
+    _DETAIL_DC_RE = re.compile(
+        r'^\s+'
+        r'(?:\d{4,5}\s+)?'
+        r'(?:\d{4,15}\s+)?'
+        r'(.+?)\s+'
+        r'(-?(?:\d{1,3})(?:\.\d{3})*,\d{2})\s+([DC])'
+        r'(?:\s+(?:\d{1,3})(?:\.\d{3})*,\d{2}\s+[DC])?'
         r'\s*$'
     )
 
-    # Linhas de saldo/cabeçalho que devem ser ignoradas silenciosamente
+    # Linhas ignoradas silenciosamente
     _SKIP_RE = re.compile(
         r'Saldo\s+Anterior|BB\s+Rende\s+F[áa]cil|Rende\s+Facil'
         r'|S\s*A\s*L\s*D\s*O\b'
+        r'|Saldo\s+do\s+dia'
         r'|Dt\.\s*balancete|Dt\.\s*movimento'
         r'|Lan[çc]amentos'
-        r'|Ag[êe]ncia\s+\d'
-        r'|Conta\s+corrente'
+        r'|Ag[êe]ncia[:\s]+\d'
         r'|Per[íi]odo\s+do\s+extrato'
-        r'|Cliente\s*-|Consultas\s*-'
+        r'|Cliente\s*[-–]|Consultas\s*[-–]'
         r'|Servi[çc]o\s+de\s+Atendimento'
         r'|Transa[çc][ãa]o\s+efetuada'
         r'|Ouvidoria'
         r'|Hist[óo]rico\s+Documento'
-        r'|Valor\s+R\$',
+        r'|Valor\s+R\$'
+        r'|Dia\s+Lote\s+Documento'
+        r'|Lote\s+Documento\s+Hist'
+        r'|Informa[çc][õo]es\s+(Adicionais|Complementares)'
+        r'|Limite\s+Ouro|Taxa\s+Cheque|Tributos'
+        r'|Custo\s+Efetivo|Data\s+Venc\.'
+        r'|Total\s+Aplic'
+        r'|Valor\s+Total\s+Devido|Valor\s+Liberado|Despesas'
+        r'|Tarifa\b.*\d'
+        r'|Simula[çc][ãa]o\s+para',
         re.IGNORECASE,
     )
 
-    # Detecta se a linha de continuação contém apenas dígitos/separadores (ruído)
-    _ONLY_DIGITS_RE = re.compile(r'^[\d\s./\-]+$')
+    # Linha de tipo/histórico complementar (sem data, sem valor, texto simples)
+    # Ex: "                     Pix - Recebido                               "
+    _HIST_TYPE_RE = re.compile(
+        r'^\s{20,}'       # indentação longa (coluna de histórico)
+        r'([A-Za-zÀ-ÿ][^\d()\n]{3,}?)'  # texto sem dígitos
+        r'\s*$'
+    )
+
+    # Linha âncora de data COM histórico inline (sem lote/doc numéricos):
+    # Ex: "    05/01/2026                       Pagto conta telefone     "
+    # Ex: "    05/01/2026                       Pix - Enviado            "
+    # Ex: "    02/01/2026                       BB Rende Fácil           "
+    _DATE_WITH_HIST_RE = re.compile(
+        r'^\s*(\d{2}/\d{2}/\d{4})\s{5,}'   # data + muitos espaços
+        r'([A-Za-zÀ-ÿ][^\d()\n]+?)'         # histórico (começa com letra)
+        r'\s*$'
+    )
+
+    # Linha de detalhe SEM histórico — só lote + doc + valor
+    # Ex: "             13105   10501                                               589,23 (-)"
+    # Ex: "                     9903                                                429,16 (-)"
+    _DETAIL_NO_HIST_RE = re.compile(
+        r'^\s+'
+        r'(?:\d{4,5}\s+)?'                          # lote opcional
+        r'\d{4,15}\s+'                              # documento
+        r'\s*'
+        r'((?:\d{1,3})(?:\.\d{3})*,\d{2})\s+'      # valor
+        r'\(([+\-])\)\s*$'                          # indicador
+    )
+
+    # Linha de continuação com beneficiário (aparece APÓS linha de detalhe sem hist)
+    # Ex: "                                     05/01 19:37 FLAVIA TUAINE RAMOS"
+    # Ex: "                                     VIVO SP"
+    _CONT_BENEF_RE = re.compile(r'^\s{30,}(.+?)\s*$')
 
     def parse(self, full_text: str) -> ParseResult:
         self._result = ParseResult(banco="bb")
         lines = full_text.split('\n')
         total = len(lines)
         self._result.total_linhas_pdf = total
-
-        # Estima páginas pelo número de cabeçalhos de data no topo ou form feeds
         pages = max(1, full_text.count('\f') + full_text.count('G3310'))
 
-        # ── Debug: exibe as primeiras 10 linhas brutas para diagnóstico ────────
-        log.debug("=== BB RAW (primeiras 10 linhas) ===")
-        for i, l in enumerate(lines[:10], 1):
+        log.debug("=== BB RAW (primeiras 15 linhas) ===")
+        for i, l in enumerate(lines[:15], 1):
             log.debug(f"  [{i:>3}] {l!r}")
         log.debug("=====================================")
 
-        pending_lancamento: Optional[Lancamento] = None
-        pending_line_num: int = 0
+        current_date: Optional[str] = None
+        pending_hist_type: Optional[str] = None   # tipo vindo da linha de data
+        pending_lancamento: Optional[Lancamento] = None  # aguardando beneficiário
 
-        def _flush_pending() -> None:
-            """Confirma o lançamento pendente no resultado."""
+        def _flush() -> None:
             if pending_lancamento is not None:
                 self._result.lancamentos.append(pending_lancamento)
 
         for line_num, raw_line in enumerate(lines, start=1):
             line = raw_line.rstrip()
 
-            # ── Ignora linhas vazias ──────────────────────────────────────────
             if not line.strip():
                 continue
 
-            # ── Ignora cabeçalhos / rodapés / linhas de saldo ─────────────────
             if self._SKIP_RE.search(line):
-                _flush_pending()
+                _flush()
                 pending_lancamento = None
                 continue
 
-            # ── Linha âncora: começa com data DD/MM/AAAA ──────────────────────
-            m_anchor = self._ANCHOR_DATE_RE.match(line)
-            if m_anchor:
-                # Antes de processar nova âncora, confirma a pendente anterior
-                _flush_pending()
+            # ── Linha: data + histórico inline (ex: "05/01/2026  Pix - Enviado") ─
+            m_dh = self._DATE_WITH_HIST_RE.match(line)
+            if m_dh:
+                _flush()
+                pending_lancamento = None
+                current_date     = m_dh.group(1)
+                pending_hist_type = m_dh.group(2).strip()
+                continue
+
+            # ── Linha: data apenas (sem conteúdo) ────────────────────────────
+            m_date = self._DATE_ONLY_RE.match(line)
+            if m_date:
+                _flush()
+                pending_lancamento = None
+                current_date      = m_date.group(1)
+                pending_hist_type = None
+                continue
+
+            # ── Linha de detalhe COM histórico embutido e valor (+/-) ─────────
+            m_det = self._DETAIL_RE.match(line)
+            if m_det and current_date:
+                _flush()
                 pending_lancamento = None
 
-                date_str = self._normalize_date(m_anchor.group(1))
-                rest = m_anchor.group(2).strip()
+                hist_raw  = m_det.group(1).strip()
+                valor_str = m_det.group(2)
+                indicador = m_det.group(3)
 
-                # Extrai valor + indicador D/C do final da linha
-                m_val = self._VALOR_DC_RE.search(rest)
-                if not m_val:
-                    # Linha começa com data mas não tem valor D/C reconhecível
-                    # Pode ser linha de cabeçalho ou layout desconhecido
-                    self._skip(
-                        line_num, line,
-                        "Linha com data mas sem valor D/C detectável",
-                        total, pages,
-                    )
-                    continue
+                # Remove prefixos lote/doc residuais capturados no grupo hist
+                hist_clean = re.sub(r'^\d{4,5}\s+\d{4,15}\s+', '', hist_raw).strip()
+                desc = self._build_bb_desc(pending_hist_type, hist_clean)
+                if not desc.strip():
+                    desc = hist_clean or pending_hist_type or "(sem descrição)"
+                pending_hist_type = None
 
-                raw_valor = m_val.group(1)   # ex: "13.786,09" ou "-80.000,00"
-                nat = m_val.group(2)          # "D" ou "C"
-
-                # Extrai descrição: tudo antes do par valor+D/C
-                desc_raw = rest[:m_val.start()].strip()
-
-                # Remove colunas numéricas prefixais do BB:
-                #   "0000  14397821  Pix-Recebido..."  →  "Pix-Recebido..."
-                # Formato: agência (4 dig) + espaços + lote+cod (7-8 dig) + espaço
-                desc_raw = re.sub(r'^\d{4}\s+\d{5,8}\s+', '', desc_raw).strip()
-
-                # Remove o número do documento do final (token numérico longo
-                # com pontos, ex: "10.818.552.213.311" ou "100.146.637")
-                # Esses aparecem APÓS o histórico e ANTES do valor
-                desc_raw = re.sub(r'\s+[\d.]{7,}\s*$', '', desc_raw).strip()
-
-                # Normaliza valor
-                negativo = raw_valor.startswith('-')
-                valor = parse_valor_br(raw_valor.lstrip('-'))
-
+                valor = parse_valor_br(valor_str)
                 if valor is None:
-                    self._skip(
-                        line_num, line,
-                        f"Valor inválido não pôde ser convertido: {raw_valor!r}",
-                        total, pages,
-                    )
+                    self._skip(line_num, line, f"Valor inválido: {valor_str!r}", total, pages)
                     continue
 
-                # Cria lançamento pendente (pode receber continuação)
-                pending_lancamento = Lancamento(
-                    data=date_str,
-                    descricao=self._clean_description(desc_raw) or "(sem descrição)",
-                    debito=valor  if (negativo or nat == 'D') else None,
-                    credito=valor if (not negativo and nat == 'C') else None,
-                )
-                pending_line_num = line_num
+                is_cred = (indicador == '+')
+                self._result.lancamentos.append(Lancamento(
+                    data=current_date,
+                    descricao=self._clean_description(desc),
+                    debito=valor  if not is_cred else None,
+                    credito=valor if     is_cred else None,
+                ))
                 continue
 
-            # ── Linha de continuação: enriquece a descrição do lançamento ─────
+            # ── Linha de detalhe SEM histórico (beneficiário vem depois) ──────
+            m_noH = self._DETAIL_NO_HIST_RE.match(line)
+            if m_noH and current_date:
+                _flush()
+
+                valor_str = m_noH.group(1)
+                indicador = m_noH.group(2)
+                valor = parse_valor_br(valor_str)
+                if valor is None:
+                    self._skip(line_num, line, f"Valor inválido: {valor_str!r}", total, pages)
+                    pending_lancamento = None
+                    pending_hist_type  = None
+                    continue
+
+                is_cred = (indicador == '+')
+                # Cria lançamento com a descrição que temos até agora
+                desc = pending_hist_type or "(sem descrição)"
+                pending_hist_type = None
+                pending_lancamento = Lancamento(
+                    data=current_date,
+                    descricao=self._clean_description(desc),
+                    debito=valor  if not is_cred else None,
+                    credito=valor if     is_cred else None,
+                )
+                continue
+
+            # ── Linha de beneficiário/complemento (após detalhe sem hist) ─────
             if pending_lancamento is not None:
-                stripped = line.strip()
-                # Descarta linhas que são só dígitos/códigos numéricos
-                if stripped and not self._ONLY_DIGITS_RE.match(stripped):
-                    # Anexa à descrição apenas se não for ruído de layout
-                    # (evita duplicar o histórico principal)
-                    current = pending_lancamento.descricao
-                    if stripped.upper() not in current.upper():
+                m_cont = self._CONT_BENEF_RE.match(line)
+                if m_cont:
+                    benef = m_cont.group(1).strip()
+                    # Descarta linhas que são apenas dígitos ou "Rende Facil" de rodapé
+                    if benef and not re.match(r'^[\d\s./\-:]+$', benef):
+                        # Limpa prefixo de data/hora do beneficiário
+                        benef = re.sub(r'^\d{2}/\d{2}\s+\d{2}:\d{2}\s+', '', benef).strip()
+                        current_desc = pending_lancamento.descricao
+                        new_desc = f"{current_desc} | {benef}" if benef.upper() not in current_desc.upper() else current_desc
                         pending_lancamento = Lancamento(
                             data=pending_lancamento.data,
-                            descricao=self._clean_description(
-                                f"{current} | {stripped}"
-                            ),
+                            descricao=self._clean_description(new_desc),
                             debito=pending_lancamento.debito,
                             credito=pending_lancamento.credito,
                         )
+                continue
 
-        # Confirma o último lançamento pendente
-        _flush_pending()
+            # ── Fallback: layout legado D/C ───────────────────────────────────
+            m_dc = self._DETAIL_DC_RE.match(line)
+            if m_dc and current_date:
+                _flush()
+                pending_lancamento = None
+
+                hist_raw  = m_dc.group(1).strip()
+                valor_str = m_dc.group(2)
+                nat       = m_dc.group(3)
+                desc = self._build_bb_desc(pending_hist_type, hist_raw)
+                pending_hist_type = None
+
+                negativo = valor_str.startswith('-')
+                valor = parse_valor_br(valor_str.lstrip('-'))
+                if valor is None:
+                    self._skip(line_num, line, f"Valor inválido: {valor_str!r}", total, pages)
+                    continue
+
+                is_cred = (not negativo and nat == 'C')
+                self._result.lancamentos.append(Lancamento(
+                    data=current_date,
+                    descricao=self._clean_description(desc),
+                    debito=valor  if not is_cred else None,
+                    credito=valor if     is_cred else None,
+                ))
+
+        _flush()
 
         log.debug(
             f"BB: {self._result.total_lancamentos} lançamentos, "
@@ -597,12 +693,24 @@ class BancoBrasilParser(BankParser):
         )
         return self._result
 
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
     @staticmethod
-    def _normalize_date(date_str: str) -> str:
-        p = date_str.split('/')
-        if len(p[2]) == 2:
-            p[2] = '20' + p[2]
-        return '/'.join(p)
+    def _build_bb_desc(hist_type: Optional[str], hist_raw: str) -> str:
+        """
+        Combina o tipo de histórico (ex: 'Pix - Recebido') com o detalhe
+        do beneficiário/complemento (ex: '01/01 17:12 ... ANDREIA BEL').
+        Remove o prefixo de data/hora e CPF/CNPJ do beneficiário.
+        """
+        # Remove prefixo DD/MM HH:MM e CPF/CNPJ numérico do histórico bruto
+        # Ex: "01/01 17:12 00008660005422 ANDREIA BEL" → "ANDREIA BEL"
+        detail = re.sub(r'^\d{2}/\d{2}\s+\d{2}:\d{2}\s+\d+\s*', '', hist_raw).strip()
+        # Remove CPF/CNPJ isolado no início
+        detail = re.sub(r'^\d{11,14}\s+', '', detail).strip()
+
+        if hist_type and detail:
+            return f"{hist_type} | {detail}"
+        return hist_type or detail or hist_raw
 
 
 # ── Itaú ──────────────────────────────────────────────────────────────────────
