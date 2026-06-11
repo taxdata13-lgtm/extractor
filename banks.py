@@ -456,7 +456,7 @@ class BancoBrasilParser(BankParser):
         r'^\s+'                                      # indentação (sem data)
         r'(?:\d{4,5}\s+)?'                           # lote opcional
         r'(?:\d{4,15}\s+)?'                          # documento opcional
-        r'(.+?)\s+'                                  # histórico (capturado)
+        r'(\S.{2,}?)\s+'                             # histórico: mín 3 chars, começa em não-espaço
         r'((?:\d{1,3})(?:\.\d{3})*,\d{2})\s+'       # valor BR
         r'\(([+\-])\)\s*$'                           # indicador (+/-)
     )
@@ -560,18 +560,19 @@ class BancoBrasilParser(BankParser):
             if not line.strip():
                 continue
 
-            if self._SKIP_RE.search(line):
-                _flush()
-                pending_lancamento = None
-                continue
-
-            # ── Linha: data + histórico inline (ex: "05/01/2026  Pix - Enviado") ─
+            # ── Linha: data + histórico inline — verificar ANTES do SKIP ─────
+            # (evita que "BB Rende Fácil" seja descartado pelo SKIP antes do flush)
             m_dh = self._DATE_WITH_HIST_RE.match(line)
             if m_dh:
                 _flush()
                 pending_lancamento = None
-                current_date     = m_dh.group(1)
+                current_date      = m_dh.group(1)
                 pending_hist_type = m_dh.group(2).strip()
+                continue
+
+            if self._SKIP_RE.search(line):
+                _flush()
+                pending_lancamento = None
                 continue
 
             # ── Linha: data apenas (sem conteúdo) ────────────────────────────
@@ -595,6 +596,26 @@ class BancoBrasilParser(BankParser):
 
                 # Remove prefixos lote/doc residuais capturados no grupo hist
                 hist_clean = re.sub(r'^\d{4,5}\s+\d{4,15}\s+', '', hist_raw).strip()
+
+                # Se hist_clean é puramente numérico (código de documento),
+                # trata como sem histórico — beneficiário virá na próxima linha
+                if re.match(r'^\d+$', hist_clean):
+                    valor = parse_valor_br(valor_str)
+                    if valor is None:
+                        self._skip(line_num, line, f"Valor inválido: {valor_str!r}", total, pages)
+                        pending_hist_type = None
+                        continue
+                    is_cred = (indicador == '+')
+                    desc = pending_hist_type or "(sem descrição)"
+                    pending_hist_type = None
+                    pending_lancamento = Lancamento(
+                        data=current_date,
+                        descricao=self._clean_description(desc),
+                        debito=valor  if not is_cred else None,
+                        credito=valor if     is_cred else None,
+                    )
+                    continue
+
                 desc = self._build_bb_desc(pending_hist_type, hist_clean)
                 if not desc.strip():
                     desc = hist_clean or pending_hist_type or "(sem descrição)"
@@ -645,8 +666,12 @@ class BancoBrasilParser(BankParser):
                 m_cont = self._CONT_BENEF_RE.match(line)
                 if m_cont:
                     benef = m_cont.group(1).strip()
-                    # Descarta linhas que são apenas dígitos ou "Rende Facil" de rodapé
-                    if benef and not re.match(r'^[\d\s./\-:]+$', benef):
+                    # Descarta: só dígitos, "Rende Facil", ou tipo de histórico
+                    # ("Pix - Enviado", "Pix - Recebido") que não é beneficiário
+                    is_hist_type = bool(re.match(
+                        r'Pix\s*[-–]|Pagto|TED|DOC|Saque|Dep[oó]sito|Tarifa',
+                        benef, re.IGNORECASE))
+                    if benef and not re.match(r'^[\d\s./\-:]+$', benef) and not is_hist_type:
                         # Limpa prefixo de data/hora do beneficiário
                         benef = re.sub(r'^\d{2}/\d{2}\s+\d{2}:\d{2}\s+', '', benef).strip()
                         current_desc = pending_lancamento.descricao
@@ -657,6 +682,10 @@ class BancoBrasilParser(BankParser):
                             debito=pending_lancamento.debito,
                             credito=pending_lancamento.credito,
                         )
+                        # Após capturar o beneficiário, faz flush imediato para
+                        # não capturar linhas seguintes como continuação
+                        _flush()
+                        pending_lancamento = None
                 continue
 
             # ── Fallback: layout legado D/C ───────────────────────────────────
@@ -699,17 +728,21 @@ class BancoBrasilParser(BankParser):
     def _build_bb_desc(hist_type: Optional[str], hist_raw: str) -> str:
         """
         Combina o tipo de histórico (ex: 'Pix - Recebido') com o detalhe
-        do beneficiário/complemento (ex: '01/01 17:12 ... ANDREIA BEL').
-        Remove o prefixo de data/hora e CPF/CNPJ do beneficiário.
+        do beneficiário/complemento. Limpa prefixos de data/hora, CPF/CNPJ
+        e códigos numéricos de documento que não são o nome do beneficiário.
         """
-        # Remove prefixo DD/MM HH:MM e CPF/CNPJ numérico do histórico bruto
-        # Ex: "01/01 17:12 00008660005422 ANDREIA BEL" → "ANDREIA BEL"
+        # Remove prefixo DD/MM HH:MM + CPF/CNPJ numérico
         detail = re.sub(r'^\d{2}/\d{2}\s+\d{2}:\d{2}\s+\d+\s*', '', hist_raw).strip()
         # Remove CPF/CNPJ isolado no início
         detail = re.sub(r'^\d{11,14}\s+', '', detail).strip()
+        # Remove número de documento isolado (4-6 dígitos, ex: "10501")
+        detail = re.sub(r'^\d{4,6}$', '', detail).strip()
 
         if hist_type and detail:
             return f"{hist_type} | {detail}"
+        # Se detail ficou vazio ou é só dígitos, retorna apenas hist_type
+        if re.match(r'^\d+$', detail or ''):
+            return hist_type or ''
         return hist_type or detail or hist_raw
 
 
