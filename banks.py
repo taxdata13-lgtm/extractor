@@ -144,6 +144,17 @@ class SicoobParser(BankParser):
     _DOC_RE = re.compile(r'^[\d*]+[.\s][\d*]+[\s.-][\d*]{4}[-.]?[\d*]*$')
 
     def parse(self, full_text: str) -> ParseResult:
+        """
+        Ponto de entrada único do Sicoob: detecta qual dos dois layouts
+        conhecidos está no texto e delega para o parser específico.
+        """
+        if self._is_extrato_conta_corrente(full_text):
+            return self._parse_extrato_conta_corrente(full_text)
+        return self._parse_internet_banking(full_text)
+
+    # ── Sub-layout 1: Internet Banking (HTML → PDF) ─────────────────────────────
+
+    def _parse_internet_banking(self, full_text: str) -> ParseResult:
         self._result = ParseResult(banco="sicoob")
         year = self._extract_year(full_text)
 
@@ -255,6 +266,165 @@ class SicoobParser(BankParser):
         if notes:
             parts.append(' | '.join(notes[:2]))
         return ' - '.join(p for p in parts if p)
+
+    # ── Sub-layout 2: Extrato Conta Corrente nativo (SISBR / app/portal) ───────
+    #
+    # Layout (pdfplumber layout=True), sem "R$" e sem "Sicoob | Internet
+    # Banking" no cabeçalho — gerado diretamente pela Plataforma SISBR:
+    #
+    #     [indent] DD/MM  HISTÓRICO                    VALOR[D|C]
+    #     [indent+] DOC.: NNNNNN                          (linha de detalhe)
+    #     [indent+] NOME REMETENTE/CNPJ/CODIGO TED         (linha de detalhe)
+    #
+    # A ordem cronológica é decrescente (mais recente primeiro) e cada dia
+    # inicia com uma linha "SALDO DO DIA" (ignorada). O extrato termina no
+    # bloco "RESUMO", a partir do qual tudo é saldo/tarifa e não mais
+    # movimentação — o parser para de processar linhas nesse ponto.
+
+    _EXTRATO_CC_MARKERS = (
+        "PLATAFORMA DE SERVIÇOS FINANCEIROS DO SICOOB",
+        "EXTRATO CONTA CORRENTE",
+    )
+
+    # Linha de transação: DD/MM + histórico + valor terminado em D, C (débito/
+    # crédito) ou * (saldo bloqueado — sempre ignorado, nunca é lançamento).
+    _CC_TX_RE = re.compile(
+        r'^\s*(\d{2}/\d{2})\s+(.+?)\s{2,}([\d.,]+)([DC*])\s*$'
+    )
+
+    _CC_PERIODO_RE = re.compile(
+        r'PER[ÍI]ODO:\s*(\d{2})/(\d{2})/(\d{4})\s*-\s*(\d{2})/(\d{2})/(\d{4})'
+    )
+
+    _CC_SKIP_HIST = frozenset([
+        'SALDO DO DIA', 'SALDO ANTERIOR', 'SALDO BLOQ.ANTERIOR',
+    ])
+
+    _CC_STOP_MARKER = 'RESUMO'
+
+    @classmethod
+    def _is_extrato_conta_corrente(cls, text: str) -> bool:
+        text_upper = text.upper()
+        return any(marker in text_upper for marker in cls._EXTRATO_CC_MARKERS)
+
+    def _parse_extrato_conta_corrente(self, full_text: str) -> ParseResult:
+        self._result = ParseResult(banco="sicoob")
+        lines = full_text.split('\n')
+        total = len(lines)
+        self._result.total_linhas_pdf = total
+        pages = max(1, full_text.count('EXTRATO CONTA CORRENTE'))
+
+        start_month, start_year, end_month, end_year = self._extract_periodo_cc(full_text)
+
+        i = 0
+        while i < total:
+            line = lines[i]
+            line_num = i + 1
+
+            if line.strip() == self._CC_STOP_MARKER:
+                # Fim da movimentação: a partir daqui é bloco de resumo/saldo.
+                break
+
+            m = self._CC_TX_RE.match(line)
+            if not m:
+                i += 1
+                continue
+
+            date_dm, hist_raw, valor_str, nat = m.groups()
+            hist = hist_raw.strip()
+
+            # Coleta linhas de detalhe (DOC., remetente, CNPJ, código TED etc.)
+            # até a próxima linha de transação, o marcador RESUMO, ou o fim.
+            detail_parts: List[str] = []
+            j = i + 1
+            while j < total:
+                next_line = lines[j]
+                next_stripped = next_line.strip()
+                if not next_stripped:
+                    j += 1
+                    continue
+                if next_stripped == self._CC_STOP_MARKER or self._CC_TX_RE.match(next_line):
+                    break
+                detail_parts.append(next_stripped)
+                j += 1
+
+            # Linhas de saldo (não são lançamentos) e saldo bloqueado ('*')
+            # são puladas intencionalmente, sem gerar aviso de linha ignorada.
+            if hist.upper() in self._CC_SKIP_HIST or nat == '*':
+                i = j
+                continue
+
+            valor = parse_valor_br(valor_str)
+            if valor is None:
+                self._skip(
+                    line_num, line,
+                    f"Valor inválido não pôde ser convertido: {valor_str!r}",
+                    total, pages,
+                )
+                i = j
+                continue
+
+            if nat not in ('D', 'C'):
+                self._skip(
+                    line_num, line,
+                    f"Indicador D/C desconhecido: {nat!r}",
+                    total, pages,
+                )
+                i = j
+                continue
+
+            day, month = date_dm.split('/')
+            year = self._resolve_year_cc(month, start_month, start_year, end_month, end_year)
+            data_full = f"{day}/{month}/{year}"
+
+            desc = ' - '.join([hist] + detail_parts)
+
+            self._result.lancamentos.append(Lancamento(
+                data=data_full,
+                descricao=self._clean_description(desc),
+                debito=valor if nat == 'D' else None,
+                credito=valor if nat == 'C' else None,
+            ))
+
+            i = j
+
+        log.debug(
+            f"Sicoob (Extrato Conta Corrente): {self._result.total_lancamentos} lançamentos, "
+            f"{self._result.total_ignoradas} linhas ignoradas."
+        )
+        return self._result
+
+    def _extract_periodo_cc(self, text: str):
+        """Extrai mês/ano de início e fim a partir de 'PERÍODO: DD/MM/AAAA - DD/MM/AAAA'."""
+        m = self._CC_PERIODO_RE.search(text)
+        if not m:
+            today = datetime.date.today()
+            ym = f"{today.month:02d}"
+            return ym, str(today.year), ym, str(today.year)
+        _, start_month, start_year, _, end_month, end_year = m.groups()
+        return start_month, start_year, end_month, end_year
+
+    @staticmethod
+    def _resolve_year_cc(
+        month: str, start_month: str, start_year: str,
+        end_month: str, end_year: str,
+    ) -> str:
+        """
+        Resolve o ano de uma data DD/MM sem ano explícito, com base no
+        período do extrato. O extrato do Sicoob é decrescente e inclui a
+        linha 'SALDO ANTERIOR' do último dia do mês anterior ao período —
+        por isso datas fora do mês do período precisam de tratamento
+        especial (ex.: mês 12 aparecendo num período iniciado em janeiro).
+        """
+        if month == start_month:
+            return start_year
+        if month == end_month:
+            return end_year
+        if int(month) > int(start_month):
+            # Mês numericamente maior que o início do período = mês anterior
+            # do ano anterior (ex.: "31/12" antes de um período em "01/2026").
+            return str(int(start_year) - 1)
+        return start_year
 
 
 # ── Santander ─────────────────────────────────────────────────────────────────
