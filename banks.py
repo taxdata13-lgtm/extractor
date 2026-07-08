@@ -145,9 +145,16 @@ class SicoobParser(BankParser):
 
     def parse(self, full_text: str) -> ParseResult:
         """
-        Ponto de entrada único do Sicoob: detecta qual dos dois layouts
+        Ponto de entrada único do Sicoob: detecta qual dos três layouts
         conhecidos está no texto e delega para o parser específico.
+
+        A checagem do sub-layout 3 (SISBR nativo, coluna DOCUMENTO explícita)
+        vem antes da checagem do sub-layout 2 (Plataforma SISBR), pois ambos
+        contêm a string "EXTRATO CONTA CORRENTE" — o marcador "SISBR -
+        SISTEMA DE INFORMÁTICA DO SICOOB" é o que os diferencia.
         """
+        if self._is_extrato_conta_corrente_v2(full_text):
+            return self._parse_extrato_conta_corrente_v2(full_text)
         if self._is_extrato_conta_corrente(full_text):
             return self._parse_extrato_conta_corrente(full_text)
         return self._parse_internet_banking(full_text)
@@ -425,6 +432,135 @@ class SicoobParser(BankParser):
             # do ano anterior (ex.: "31/12" antes de um período em "01/2026").
             return str(int(start_year) - 1)
         return start_year
+
+
+    # ── Sub-layout 3: Extrato Conta Corrente SISBR com coluna DOCUMENTO ─────────
+    #
+    # Layout (pdfplumber layout=True), identificado pelo cabeçalho fixo
+    # "SISBR - SISTEMA DE INFORMÁTICA DO SICOOB" (relatório gerado direto do
+    # SISBR, não pela Plataforma de Serviços Financeiros nem pelo Internet
+    # Banking). Colunas nominais: DATA | DOCUMENTO | HISTÓRICO | VALOR.
+    #
+    #     [indent] DD/MM/AAAA  DOC   HISTÓRICO                    VALOR[D|C|*]
+    #     [indent+] linha de detalhe (NF, remetente, FAV.:, CNPJ/CPF etc.)
+    #
+    # Diferenças-chave em relação ao sub-layout 2:
+    #   • data já vem com ano completo (DD/MM/AAAA), não precisa resolver ano;
+    #   • existe coluna DOCUMENTO entre data e histórico, mas ela não tem
+    #     largura fixa confiável — pode "vazar" para a coluna do histórico
+    #     quando o conteúdo é longo (ex.: "CPFL PAULI"), e o espaçamento antes
+    #     do valor pode ser de apenas 1 espaço quando o histórico é extenso.
+    #     Por isso o valor é capturado ancorado ao fim da linha (em vez de
+    #     depender de "\\s{2,}" como separador de coluna), e documento +
+    #     histórico são mantidos juntos como um único campo de descrição;
+    #   • marcador de fim de dia é "SALDO DO DIA ===== >" (com setas).
+
+    _CC2_MARKERS = (
+        "SISBR - SISTEMA DE INFORMÁTICA DO SICOOB",
+        "SISBR - SISTEMA DE INFORMATICA DO SICOOB",
+    )
+
+    _CC2_TX_RE = re.compile(
+        r'^\s*(\d{2}/\d{2}/\d{4})\s+(.+?)\s*([\d.]+,\d{2})([DC*])\s*$'
+    )
+
+    _CC2_SKIP_HIST = frozenset([
+        'SALDO ANTERIOR', 'SALDO BLOQUEADO ANTERIOR', 'SALDO BLOQ.ANTERIOR',
+    ])
+
+    _CC2_SALDO_DIA_RE = re.compile(r'^SALDO\s+DO\s+DIA\b')
+
+    _CC2_STOP_MARKER = 'RESUMO'
+
+    @classmethod
+    def _is_extrato_conta_corrente_v2(cls, text: str) -> bool:
+        text_upper = text.upper()
+        return any(marker.upper() in text_upper for marker in cls._CC2_MARKERS)
+
+    def _parse_extrato_conta_corrente_v2(self, full_text: str) -> ParseResult:
+        self._result = ParseResult(banco="sicoob")
+        lines = full_text.split('\n')
+        total = len(lines)
+        self._result.total_linhas_pdf = total
+        pages = max(1, full_text.count('EXTRATO CONTA CORRENTE'))
+
+        i = 0
+        while i < total:
+            line = lines[i]
+            line_num = i + 1
+            stripped = line.strip()
+
+            if stripped == self._CC2_STOP_MARKER:
+                # Fim da movimentação: a partir daqui é bloco de resumo/saldo.
+                break
+
+            m = self._CC2_TX_RE.match(line)
+            if not m:
+                i += 1
+                continue
+
+            date_str, hist_raw, valor_str, nat = m.groups()
+            hist = self._clean_description(hist_raw)
+
+            # Coleta linhas de detalhe (NF, remetente, FAV.:, CNPJ/CPF etc.)
+            # até a próxima transação, o marcador "SALDO DO DIA", "RESUMO"
+            # ou o fim do texto.
+            detail_parts: List[str] = []
+            j = i + 1
+            while j < total:
+                next_line = lines[j]
+                next_stripped = next_line.strip()
+                if not next_stripped:
+                    j += 1
+                    continue
+                if (next_stripped == self._CC2_STOP_MARKER
+                        or self._CC2_SALDO_DIA_RE.match(next_stripped)
+                        or self._CC2_TX_RE.match(next_line)):
+                    break
+                detail_parts.append(next_stripped)
+                j += 1
+
+            # Linhas de saldo (abertura) e saldo bloqueado ('*') são puladas
+            # intencionalmente, sem gerar aviso de linha ignorada.
+            if hist.upper() in self._CC2_SKIP_HIST or nat == '*':
+                i = j
+                continue
+
+            valor = parse_valor_br(valor_str)
+            if valor is None:
+                self._skip(
+                    line_num, line,
+                    f"Valor inválido não pôde ser convertido: {valor_str!r}",
+                    total, pages,
+                )
+                i = j
+                continue
+
+            if nat not in ('D', 'C'):
+                self._skip(
+                    line_num, line,
+                    f"Indicador D/C desconhecido: {nat!r}",
+                    total, pages,
+                )
+                i = j
+                continue
+
+            desc = ' - '.join([hist] + detail_parts)
+
+            self._result.lancamentos.append(Lancamento(
+                data=date_str,
+                descricao=self._clean_description(desc),
+                debito=valor if nat == 'D' else None,
+                credito=valor if nat == 'C' else None,
+            ))
+
+            i = j
+
+        log.debug(
+            f"Sicoob (Extrato Conta Corrente SISBR): {self._result.total_lancamentos} lançamentos, "
+            f"{self._result.total_ignoradas} linhas ignoradas."
+        )
+        return self._result
 
 
 # ── Santander ─────────────────────────────────────────────────────────────────
